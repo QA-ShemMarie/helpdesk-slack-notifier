@@ -3,11 +3,11 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 
 const {
-  PORT = 3000,
+  PORT = 100000,
   GITHUB_WEBHOOK_SECRET,
   GITHUB_TOKEN, // needed for titles, descriptions, and comment filtering
   PROJECT_NUMBER, // only notify for this project (e.g. 68)
-  SNIPPET_LENGTH = 10000, // max characters of description/comment shown in Slack
+  SNIPPET_LENGTH = 300, // max characters of description/comment shown in Slack
   SLACK_BOT_TOKEN, // enables threading (one message per issue, updates as replies)
   SLACK_CHANNEL_ID, // channel ID (looks like C0123ABCD) for the bot to post in
   SLACK_WEBHOOK_URL, // fallback without threading
@@ -85,6 +85,20 @@ async function handleItemEvent(payload) {
   if (action === "reordered") return; // too noisy
 
   const info = GITHUB_TOKEN ? await lookup(item.content_node_id, item.project_node_id) : null;
+
+  // Temporary debug line: shows what GitHub sent and what the lookup returned
+  console.log(
+    "item event:",
+    JSON.stringify({
+      action,
+      field: changes?.field_value,
+      content_type: item.content_type,
+      has_content_node_id: !!item.content_node_id,
+      lookup_ok: !!info,
+      item_type: info?.item?.__typename ?? null,
+      assignees: info?.item?.assignees?.nodes ?? null,
+    })
+  );
 
   if (PROJECT_NUMBER && info?.project && String(info.project.number) !== String(PROJECT_NUMBER)) {
     return; // different project
