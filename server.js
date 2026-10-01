@@ -122,9 +122,20 @@ async function handleItemEvent(payload) {
       break;
     case "edited": {
       const fv = changes?.field_value;
-      replyText = fv
-        ? `:pencil2: ${who} changed *${escapeSlack(fv.field_name)}*: ${fmt(fv.from)} → ${fmt(fv.to)}`
-        : `:pencil2: ${who} edited this`;
+      if (fv && (fv.field_type === "assignees" || fv.field_name === "Assignees") && info?.item) {
+        // GitHub doesn't include the people in the event, so we show the current list.
+        const people = (info.item.assignees?.nodes ?? []).map(
+          (n) => `<https://github.com/${n.login}|${n.login}>`
+        );
+        replyText = `:bust_in_silhouette: ${who} changed *Assignees*: now ${people.length ? people.join(", ") : "_none_"}`;
+      } else if (fv && (fv.field_type === "labels" || fv.field_name === "Labels") && info?.item) {
+        const labels = (info.item.labels?.nodes ?? []).map((n) => `\`${escapeSlack(n.name)}\``);
+        replyText = `:label: ${who} changed *Labels*: now ${labels.length ? labels.join(" ") : "_none_"}`;
+      } else if (fv) {
+        replyText = `:pencil2: ${who} changed *${escapeSlack(fv.field_name)}*: ${fmt(fv.from)} → ${fmt(fv.to)}`;
+      } else {
+        replyText = `:pencil2: ${who} edited this`;
+      }
       break;
     }
     default:
@@ -283,9 +294,9 @@ async function lookup(itemId, projectId) {
     query($item: ID!, $project: ID!) {
       item: node(id: $item) {
         __typename
-        ... on Issue { title url body }
-        ... on PullRequest { title url body }
-        ... on DraftIssue { title body }
+        ... on Issue { title url body assignees(first: 10) { nodes { login } } labels(first: 20) { nodes { name } } }
+        ... on PullRequest { title url body assignees(first: 10) { nodes { login } } labels(first: 20) { nodes { name } } }
+        ... on DraftIssue { title body assignees(first: 10) { nodes { login } } }
       }
       project: node(id: $project) {
         ... on ProjectV2 { title number url }
