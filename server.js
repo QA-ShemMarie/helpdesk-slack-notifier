@@ -7,7 +7,7 @@ const {
   GITHUB_WEBHOOK_SECRET,
   GITHUB_TOKEN, // needed for titles, descriptions, and comment filtering
   PROJECT_NUMBER, // only notify for this project (e.g. 68)
-  SNIPPET_LENGTH = 300, // max characters of description/comment shown in Slack
+  SNIPPET_LENGTH = 10000, // max characters of description/comment shown in Slack
   SLACK_BOT_TOKEN, // enables threading (one message per issue, updates as replies)
   SLACK_CHANNEL_ID, // channel ID (looks like C0123ABCD) for the bot to post in
   SLACK_WEBHOOK_URL, // fallback without threading
