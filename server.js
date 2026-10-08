@@ -3,15 +3,16 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 
 const {
-  PORT = 100000,
+  PORT = 3000,
   GITHUB_WEBHOOK_SECRET,
-  GITHUB_TOKEN, // needed for titles, descriptions, and comment filtering
+  GITHUB_TOKEN, // needed for titles, descriptions, and project filtering
   PROJECT_NUMBER, // only notify for this project (e.g. 68)
   SNIPPET_LENGTH = 10000, // max characters of description/comment shown in Slack
   SLACK_BOT_TOKEN, // enables threading (one message per issue, updates as replies)
   SLACK_CHANNEL_ID, // channel ID (looks like C0123ABCD) for the bot to post in
   SLACK_WEBHOOK_URL, // fallback without threading
   THREADS_FILE = "threads.json", // remembers which Slack message belongs to which issue
+  SNAPSHOTS_FILE = "snapshots.json", // remembers last known field values per project item
 } = process.env;
 
 if (!GITHUB_WEBHOOK_SECRET) {
@@ -27,9 +28,9 @@ if (!SLACK_BOT_TOKEN && !SLACK_WEBHOOK_URL) {
   process.exit(1);
 }
 if (!SLACK_BOT_TOKEN) console.warn("No SLACK_BOT_TOKEN: using the webhook, so messages will NOT be threaded.");
-if (!GITHUB_TOKEN) console.warn("GITHUB_TOKEN is not set: no titles/descriptions, no project filtering, comments are skipped.");
+if (!GITHUB_TOKEN) console.warn("GITHUB_TOKEN is not set: no titles/descriptions, no project filtering, issue/comment/PR events are skipped.");
 
-// ---------- Thread storage (issue -> Slack message timestamp) ----------
+// ---------- Storage (threads + field snapshots) ----------
 
 let threads = {};
 try {
@@ -45,7 +46,32 @@ function saveThreads() {
   }
 }
 
+let snapshots = {};
+try {
+  snapshots = JSON.parse(fs.readFileSync(SNAPSHOTS_FILE, "utf8"));
+} catch {
+  // first run or unreadable file: start empty
+}
+function saveSnapshots() {
+  try {
+    fs.writeFileSync(SNAPSHOTS_FILE, JSON.stringify(snapshots));
+  } catch (err) {
+    console.error("Could not save snapshots file:", err.message);
+  }
+}
+
 // ---------- Web server ----------
+
+const HANDLERS = {
+  projects_v2_item: handleItemEvent,
+  projects_v2: handleProjectEvent,
+  projects_v2_status_update: handleProjectEvent,
+  issues: handleIssueEvent,
+  issue_comment: handleCommentEvent,
+  pull_request: handlePullRequestEvent,
+  pull_request_review: handlePullRequestEvent,
+  pull_request_review_comment: handlePullRequestEvent,
+};
 
 const app = express();
 
@@ -55,14 +81,14 @@ app.post("/webhook", express.raw({ type: "application/json", limit: "5mb" }), (r
 
   const event = req.get("x-github-event");
   if (event === "ping") return res.status(200).send("pong");
-  if (event !== "projects_v2_item" && event !== "issue_comment") return res.status(204).end();
+  const run = HANDLERS[event];
+  if (!run) return res.status(204).end();
 
   // Acknowledge fast; GitHub times out webhook deliveries after ~10s.
   res.status(202).end();
 
   const payload = JSON.parse(req.body.toString("utf8"));
-  const run = event === "issue_comment" ? handleCommentEvent : handleItemEvent;
-  run(payload).catch((err) => console.error("Handler error:", err));
+  run(payload).catch((err) => console.error(`Handler error (${event}):`, err));
 });
 
 app.get("/", (_req, res) => res.send("ok"));
@@ -78,111 +104,220 @@ function verifySignature(req) {
   return received.length === expected.length && crypto.timingSafeEqual(received, expected);
 }
 
-// ---------- Project item events (cards added, moved, edited...) ----------
+// ---------- Project item events (cards added, moved, edited, reordered...) ----------
 
 async function handleItemEvent(payload) {
   const { action, projects_v2_item: item, sender, changes } = payload;
-  if (action === "reordered") return; // too noisy
 
-  const info = GITHUB_TOKEN ? await lookup(item.content_node_id, item.project_node_id) : null;
+  // Serialize per item so the snapshot compare/update never races.
+  return withLock(`snap:${item.node_id}`, async () => {
+    const info = GITHUB_TOKEN
+      ? await lookup(item.content_node_id, item.project_node_id, item.node_id)
+      : null;
 
-  // Temporary debug line: shows what GitHub sent and what the lookup returned
-  console.log(
-    "item event:",
-    JSON.stringify({
-      action,
-      field: changes?.field_value,
-      content_type: item.content_type,
-      has_content_node_id: !!item.content_node_id,
-      lookup_ok: !!info,
-      item_type: info?.item?.__typename ?? null,
-      assignees: info?.item?.assignees?.nodes ?? null,
-    })
-  );
+    // Debug line: shows what GitHub sent and what the lookup returned
+    console.log(
+      "item event:",
+      JSON.stringify({
+        action,
+        changes,
+        content_type: item.content_type,
+        has_content_node_id: !!item.content_node_id,
+        lookup_ok: !!info,
+        item_type: info?.item?.__typename ?? null,
+      })
+    );
 
-  if (PROJECT_NUMBER && info?.project && String(info.project.number) !== String(PROJECT_NUMBER)) {
-    return; // different project
+    if (PROJECT_NUMBER && info?.project && String(info.project.number) !== String(PROJECT_NUMBER)) {
+      return; // different project
+    }
+
+    const cur = info ? buildSnapshot(info) : null;
+    const prev = snapshots[item.node_id]; // undefined the first time we see this item
+
+    const title = info?.item?.title ?? `${item.content_type ?? "Item"}`;
+    const itemText = info?.item?.url ? `<${info.item.url}|${escapeSlack(title)}>` : `*${escapeSlack(title)}*`;
+    const projectText = info?.project
+      ? `<${info.project.url}|${escapeSlack(info.project.title)}>`
+      : "a project";
+    const who = userLink(sender);
+
+    // First message for this issue: title, project and description
+    let parentText = `:ticket: ${itemText} in ${projectText}`;
+    const desc = snippet(info?.item?.body);
+    if (desc) parentText += `\n${desc}`;
+
+    // Replies in the thread
+    let replyText;
+    switch (action) {
+      case "created":
+        replyText = `:heavy_plus_sign: ${who} added this to ${projectText}`;
+        break;
+      case "deleted":
+        replyText = `:wastebasket: ${who} removed this from ${projectText}`;
+        break;
+      case "archived":
+        replyText = `:file_cabinet: ${who} archived this`;
+        break;
+      case "restored":
+        replyText = `:recycle: ${who} restored this`;
+        break;
+      case "converted":
+        replyText = `:arrows_counterclockwise: ${who} converted this`;
+        break;
+      case "reordered":
+        replyText = `:arrow_up_down: ${who} reordered this`;
+        break;
+      case "edited": {
+        const fv = changes?.field_value;
+        if (fv && (fv.field_type === "assignees" || fv.field_name === "Assignees") && info?.item) {
+          // GitHub doesn't include the people in the event, so we show the current list.
+          const people = (info.item.assignees?.nodes ?? []).map(
+            (n) => `<https://github.com/${n.login}|${n.login}>`
+          );
+          replyText = `:bust_in_silhouette: ${who} changed *Assignees*: now ${people.length ? people.join(", ") : "_none_"}`;
+        } else if (fv && (fv.field_type === "labels" || fv.field_name === "Labels") && info?.item) {
+          const labels = (info.item.labels?.nodes ?? []).map((n) => `\`${escapeSlack(n.name)}\``);
+          replyText = `:label: ${who} changed *Labels*: now ${labels.length ? labels.join(" ") : "_none_"}`;
+        } else if (fv) {
+          const isTitle = fv.field_type === "title" || fv.field_name === "Title";
+          const hasPrev = !!prev;
+          // Prefer values GitHub sent; otherwise old value from our snapshot, new value from a fresh lookup.
+          const from =
+            fv.from ?? (hasPrev ? (isTitle ? prev.title : prev.fields?.[fv.field_node_id]) : undefined);
+          const to = fv.to ?? (cur ? (isTitle ? cur.title : cur.fields?.[fv.field_node_id]) : undefined);
+          const name = escapeSlack(fv.field_name ?? fv.field_type ?? "field");
+          replyText =
+            hasPrev || fv.from !== undefined
+              ? `:pencil2: ${who} changed *${name}*: ${fmt(from)} → ${fmt(to)}`
+              : `:pencil2: ${who} changed *${name}*: now ${fmt(to)}`;
+        } else if (changes?.body) {
+          replyText = `:pencil2: ${who} edited the description`;
+        } else {
+          replyText = `:pencil2: ${who} edited this`;
+        }
+        break;
+      }
+      default:
+        replyText = `${who} ${action} this`;
+    }
+
+    saveSnap(item, cur);
+
+    await notify({
+      key: item.content_node_id ?? item.node_id,
+      parentText,
+      replyText,
+      // If this event itself created the thread (e.g. "added to project"), the parent already says it.
+      skipReplyIfNew: action === "created",
+    });
+  });
+}
+
+function saveSnap(item, cur) {
+  if (!cur) return;
+  snapshots[item.node_id] = cur;
+  saveSnapshots();
+}
+
+// Current values we can compare against next time
+function buildSnapshot(info) {
+  const fields = {};
+  for (const n of info?.pitem?.fieldValues?.nodes ?? []) {
+    const id = n?.field?.id;
+    if (!id) continue;
+    fields[id] = n.name ?? n.text ?? n.number ?? n.date ?? n.title ?? null;
   }
+  return { title: info?.item?.title ?? null, fields };
+}
 
-  const title = info?.item?.title ?? `${item.content_type ?? "Item"}`;
-  const itemText = info?.item?.url ? `<${info.item.url}|${escapeSlack(title)}>` : `*${escapeSlack(title)}*`;
-  const projectText = info?.project
-    ? `<${info.project.url}|${escapeSlack(info.project.title)}>`
-    : "a project";
+// ---------- Issue events ----------
+
+async function handleIssueEvent(payload) {
+  if (!GITHUB_TOKEN) return;
+  const { action, issue, sender, changes } = payload;
+  const project = await findProjectForIssue(issue.node_id);
+  if (!project) return;
+
   const who = userLink(sender);
-
-  // First message for this issue: title, project and description
-  let parentText = `:ticket: ${itemText} in ${projectText}`;
-  const desc = snippet(info?.item?.body);
-  if (desc) parentText += `\n${desc}`;
-
-  // Replies in the thread
   let replyText;
   switch (action) {
-    case "created":
-      replyText = `:heavy_plus_sign: ${who} added this to ${projectText}`;
+    case "opened":
+      replyText = `:new: ${who} opened this issue`;
       break;
-    case "deleted":
-      replyText = `:wastebasket: ${who} removed this from ${projectText}`;
-      break;
-    case "archived":
-      replyText = `:file_cabinet: ${who} archived this`;
-      break;
-    case "restored":
-      replyText = `:recycle: ${who} restored this`;
-      break;
-    case "converted":
-      replyText = `:arrows_counterclockwise: ${who} converted this`;
-      break;
-    case "edited": {
-      const fv = changes?.field_value;
-      if (fv && (fv.field_type === "assignees" || fv.field_name === "Assignees") && info?.item) {
-        // GitHub doesn't include the people in the event, so we show the current list.
-        const people = (info.item.assignees?.nodes ?? []).map(
-          (n) => `<https://github.com/${n.login}|${n.login}>`
-        );
-        replyText = `:bust_in_silhouette: ${who} changed *Assignees*: now ${people.length ? people.join(", ") : "_none_"}`;
-      } else if (fv && (fv.field_type === "labels" || fv.field_name === "Labels") && info?.item) {
-        const labels = (info.item.labels?.nodes ?? []).map((n) => `\`${escapeSlack(n.name)}\``);
-        replyText = `:label: ${who} changed *Labels*: now ${labels.length ? labels.join(" ") : "_none_"}`;
-      } else if (fv) {
-        replyText = `:pencil2: ${who} changed *${escapeSlack(fv.field_name)}*: ${fmt(fv.from)} → ${fmt(fv.to)}`;
+    case "edited":
+      if (changes?.title) {
+        replyText = `:pencil2: ${who} changed *Title*: ${escapeSlack(changes.title.from)} → ${escapeSlack(issue.title)}`;
+      } else if (changes?.body) {
+        replyText = `:pencil2: ${who} edited the description:\n${snippet(issue.body)}`;
       } else {
         replyText = `:pencil2: ${who} edited this`;
       }
       break;
-    }
-    default:
+    case "closed":
+      replyText = `:white_check_mark: ${who} closed this${issue.state_reason ? ` (${issue.state_reason.replace("_", " ")})` : ""}`;
+      break;
+    case "reopened":
+      replyText = `:repeat: ${who} reopened this`;
+      break;
+    case "assigned":
+    case "unassigned":
+      replyText = `:bust_in_silhouette: ${who} ${action} ${userLink(payload.assignee)}`;
+      break;
+    case "labeled":
+    case "unlabeled":
+      replyText = `:label: ${who} ${action} \`${escapeSlack(payload.label?.name ?? "")}\``;
+      break;
+    case "milestoned":
+    case "demilestoned":
+      replyText = `:triangular_flag_on_post: ${who} ${action} ${escapeSlack(payload.milestone?.title ?? "")}`;
+      break;
+    case "transferred":
+      replyText = `:truck: ${who} transferred this issue`;
+      break;
+    case "deleted":
+      replyText = `:wastebasket: ${who} deleted this issue`;
+      break;
+    default: // pinned, locked, typed, etc.
       replyText = `${who} ${action} this`;
   }
 
   await notify({
-    key: item.content_node_id ?? item.node_id,
-    parentText,
+    key: issue.node_id,
+    parentText: issueParent(issue, project),
     replyText,
-    // If this event itself created the thread (e.g. "added to project"), the parent already says it.
-    skipReplyIfNew: action === "created",
+    skipReplyIfNew: action === "opened",
   });
 }
 
-// ---------- Comment events ----------
+// ---------- Comment events (created, edited, deleted) ----------
 
 async function handleCommentEvent(payload) {
-  if (payload.action !== "created") return; // new comments only
   if (!GITHUB_TOKEN) return; // can't tell which project the issue belongs to
-
-  const { issue, comment, sender } = payload;
+  const { action, issue, comment, sender } = payload;
   const project = await findProjectForIssue(issue.node_id);
   if (!project) return; // issue isn't on the project we care about
 
-  let parentText = `:ticket: <${issue.html_url}|${escapeSlack(issue.title)}> in <${project.url}|${escapeSlack(project.title)}>`;
+  const who = userLink(sender);
+  let replyText;
+  if (action === "created") {
+    replyText = `:speech_balloon: ${who} <${comment.html_url}|commented>:\n${snippet(comment.body)}`;
+  } else if (action === "edited") {
+    replyText = `:pencil2: ${who} <${comment.html_url}|edited a comment>:\n${snippet(comment.body)}`;
+  } else if (action === "deleted") {
+    replyText = `:wastebasket: ${who} deleted a comment by ${userLink(comment.user)}`;
+  } else {
+    replyText = `${who} ${action} a comment`;
+  }
+
+  await notify({ key: issue.node_id, parentText: issueParent(issue, project), replyText });
+}
+
+function issueParent(issue, project) {
+  let t = `:ticket: <${issue.html_url}|${escapeSlack(issue.title)}> in <${project.url}|${escapeSlack(project.title)}>`;
   const desc = snippet(issue.body);
-  if (desc) parentText += `\n${desc}`;
-
-  const replyText =
-    `:speech_balloon: ${userLink(sender)} <${comment.html_url}|commented>:\n` + snippet(comment.body);
-
-  await notify({ key: issue.node_id, parentText, replyText });
+  if (desc) t += `\n${desc}`;
+  return t;
 }
 
 async function findProjectForIssue(nodeId) {
@@ -198,6 +333,102 @@ async function findProjectForIssue(nodeId) {
   const projects = nodes.map((n) => n.project).filter(Boolean);
   if (PROJECT_NUMBER) return projects.find((p) => String(p.number) === String(PROJECT_NUMBER));
   return projects[0];
+}
+
+// ---------- Pull request events (PRs, reviews, review comments) ----------
+
+async function handlePullRequestEvent(payload) {
+  if (!GITHUB_TOKEN) return;
+  const { action, pull_request: pr, sender, review, comment, changes } = payload;
+  const project = await findProjectForIssue(pr.node_id);
+  if (!project) return;
+
+  const who = userLink(sender);
+  let replyText;
+  if (review) {
+    const state = (review.state ?? "").toLowerCase().replace("_", " ");
+    replyText = `:mag: ${who} <${review.html_url}|${action} a review> (${state})${review.body ? `:\n${snippet(review.body)}` : ""}`;
+  } else if (comment) {
+    replyText = `:speech_balloon: ${who} <${comment.html_url}|${action} a review comment>${action === "deleted" ? "" : `:\n${snippet(comment.body)}`}`;
+  } else {
+    switch (action) {
+      case "opened":
+        replyText = `:new: ${who} opened this pull request`;
+        break;
+      case "closed":
+        replyText = pr.merged
+          ? `:tada: ${who} merged this pull request`
+          : `:no_entry_sign: ${who} closed this pull request`;
+        break;
+      case "reopened":
+        replyText = `:repeat: ${who} reopened this pull request`;
+        break;
+      case "edited":
+        replyText = changes?.title
+          ? `:pencil2: ${who} changed *Title*: ${escapeSlack(changes.title.from)} → ${escapeSlack(pr.title)}`
+          : `:pencil2: ${who} edited this pull request`;
+        break;
+      case "synchronize":
+        replyText = `:arrow_up: ${who} pushed new commits`;
+        break;
+      case "review_requested":
+      case "review_request_removed":
+        replyText = `:eyes: ${who} ${action.replaceAll("_", " ")}${payload.requested_reviewer ? ` for ${userLink(payload.requested_reviewer)}` : ""}`;
+        break;
+      case "assigned":
+      case "unassigned":
+        replyText = `:bust_in_silhouette: ${who} ${action} ${userLink(payload.assignee)}`;
+        break;
+      case "labeled":
+      case "unlabeled":
+        replyText = `:label: ${who} ${action} \`${escapeSlack(payload.label?.name ?? "")}\``;
+        break;
+      default:
+        replyText = `${who} ${action.replaceAll("_", " ")} this pull request`;
+    }
+  }
+
+  await notify({
+    key: pr.node_id,
+    parentText: issueParent({ html_url: pr.html_url, title: pr.title, body: pr.body }, project),
+    replyText,
+    skipReplyIfNew: action === "opened" && !review && !comment,
+  });
+}
+
+// ---------- Project-level events (project edited/closed, status updates) ----------
+
+async function handleProjectEvent(payload) {
+  if (!GITHUB_TOKEN) return;
+  const { action, sender } = payload;
+  const status = payload.projects_v2_status_update;
+  const projectId = payload.projects_v2?.node_id ?? status?.project_node_id;
+  if (!projectId) return;
+
+  const data = await graphql(
+    `query($id: ID!) { node(id: $id) { ... on ProjectV2 { title number url } } }`,
+    { id: projectId }
+  );
+  const project = data?.node;
+  if (!project) return;
+  if (PROJECT_NUMBER && String(project.number) !== String(PROJECT_NUMBER)) return;
+
+  const who = userLink(sender);
+  let replyText;
+  if (status) {
+    const label = String(status.status ?? "").replaceAll("_", " ").toLowerCase();
+    replyText =
+      `:chart_with_upwards_trend: ${who} ${action} a project status update (${label})` +
+      (status.body ? `:\n${snippet(status.body)}` : "");
+  } else {
+    replyText = `:file_folder: ${who} ${action} the project`;
+  }
+
+  await notify({
+    key: `project:${projectId}`,
+    parentText: `:file_folder: <${project.url}|${escapeSlack(project.title)}>`,
+    replyText,
+  });
 }
 
 // ---------- Slack posting with threads ----------
@@ -302,10 +533,10 @@ async function graphql(query, variables) {
   }
 }
 
-// Resolve titles and descriptions from the node IDs in the webhook payload.
-async function lookup(itemId, projectId) {
+// Resolve titles, descriptions and current field values from the node IDs in the webhook payload.
+async function lookup(contentId, projectId, projectItemId) {
   const query = `
-    query($item: ID!, $project: ID!) {
+    query($item: ID!, $project: ID!, $pitem: ID!) {
       item: node(id: $item) {
         __typename
         ... on Issue { title url body assignees(first: 10) { nodes { login } } labels(first: 20) { nodes { name } } }
@@ -315,8 +546,22 @@ async function lookup(itemId, projectId) {
       project: node(id: $project) {
         ... on ProjectV2 { title number url }
       }
+      pitem: node(id: $pitem) {
+        ... on ProjectV2Item {
+          fieldValues(first: 30) {
+            nodes {
+              __typename
+              ... on ProjectV2ItemFieldSingleSelectValue { name field { ... on ProjectV2FieldCommon { id } } }
+              ... on ProjectV2ItemFieldTextValue { text field { ... on ProjectV2FieldCommon { id } } }
+              ... on ProjectV2ItemFieldNumberValue { number field { ... on ProjectV2FieldCommon { id } } }
+              ... on ProjectV2ItemFieldDateValue { date field { ... on ProjectV2FieldCommon { id } } }
+              ... on ProjectV2ItemFieldIterationValue { title field { ... on ProjectV2FieldCommon { id } } }
+            }
+          }
+        }
+      }
     }`;
-  return graphql(query, { item: itemId ?? "", project: projectId });
+  return graphql(query, { item: contentId ?? "", project: projectId, pitem: projectItemId });
 }
 
 // ---------- Formatting helpers ----------
